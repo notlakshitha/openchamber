@@ -188,7 +188,10 @@ import {
 import type { LargeTextPasteBehavior } from '@/stores/useUIStore';
 import type { FileMentionAutocompleteInputSource } from './fileMentionAutocompleteState';
 import {
-    classifyMention,
+    confirmMention,
+    dismissMention,
+    isFileMentionCandidate,
+    isMentionDismissed,
     scanMentions,
 } from './composer/language/mentions';
 import { collectKnownTokenNames, lastPrefixSigilIndex } from './composer/language/prefixTokens';
@@ -228,6 +231,7 @@ import {
 import {
     INLINE_SERVER_ATTACHMENT_ID_PREFIX,
     filterMissingInlineAttachments,
+    findMissingPaths,
     isMentionAlreadyAttached,
 } from './composer/attachments/inlineMentionAttachments';
 import { buildComposerContext, buildOutgoingMessage, expandCommentSnippets, selectComposerQueue } from './composer/submit/buildOutgoingMessage';
@@ -244,6 +248,7 @@ import type { PromptHistoryCandidate } from './composer/state/promptHistorySearc
 import { registerPromptHistorySearchRoute } from './composer/state/promptHistorySearchRoute';
 import { useComposerDraft } from './composer/state/useComposerDraft';
 import { MentionCompletionState } from './composer/state/mentionCompletion';
+import { useFileMentionCheck } from './composer/state/useFileMentionCheck';
 import { useSessionDraftPublishing } from './composer/state/useSessionDraftPublishing';
 import { useDictationOrigin } from './composer/state/useDictationOrigin';
 import { useDraftTarget } from './composer/state/useDraftTarget';
@@ -1102,10 +1107,18 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({
      * Everything the prompt language needs to resolve references. Rebuilt only
      * when a registry changes, so typing does not churn the tokenizer input.
      */
+    const [confirmedMentionsRevision, setConfirmedMentionsRevision] = React.useState(0);
+    const mentionDismissal = React.useMemo(() => ({
+        dismiss: (name: string) => dismissMention(name, confirmedMentionsRef.current),
+        hint: t('chat.chatInput.mentionChip.editHint'),
+    }), [t]);
     const languageContext = React.useMemo<ComposerLanguageContext>(() => ({
         inputMode,
         knownAgentNames,
-        confirmedMentions: confirmedMentionsRef.current,
+        // A getter: a draft switch puts a new set in the ref without a new context.
+        get confirmedMentions() { return confirmedMentionsRef.current; },
+        confirmedMentionsRevision,
+        mentionDismissal,
         knownSlashNames: knownSlashNamesWithGuests,
         knownSnippetTriggers,
         attachmentFilenames,
@@ -1114,7 +1127,7 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({
         fileIconVariant: currentTheme.metadata.variant === 'light' ? 'light' : 'dark',
         sessionLinkChips,
         sessionLinkOrigins,
-    }), [attachmentFilenames, currentTheme.metadata.variant, inputMode, knownAgentNames, knownSkillNames, knownSlashNamesWithGuests, knownSnippetTriggers, sessionLinkChips, sessionLinkOrigins]);
+    }), [attachmentFilenames, confirmedMentionsRevision, currentTheme.metadata.variant, inputMode, knownAgentNames, knownSkillNames, knownSlashNamesWithGuests, knownSnippetTriggers, mentionDismissal, sessionLinkChips, sessionLinkOrigins]);
 
     const sanitizeAttachmentsForSend = React.useCallback(
         (files: readonly AttachedFile[] | undefined): AttachedFile[] => [...(files ?? [])]
@@ -1128,11 +1141,11 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({
     );
 
     const resolveInlineFileMention = React.useCallback((mentionPath: string): { serverPath: string; filename: string; root: string } | null => {
-        const kind = classifyMention(mentionPath, {
+        const isCandidate = isFileMentionCandidate(mentionPath, {
             knownAgentNames: knownAgentNamesRef.current,
             confirmedMentions: confirmedMentionsRef.current,
         });
-        if (kind !== 'file') return null;
+        if (!isCandidate) return null;
 
         const normalizedMentionPath = mentionPath.replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '');
         if (!normalizedMentionPath) return null;
@@ -1153,6 +1166,26 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({
             root,
         };
     }, [chatSearchDirectory]);
+
+    const resolveFileMentionPath = React.useCallback(
+        (name: string) => resolveInlineFileMention(name)?.serverPath ?? null,
+        [resolveInlineFileMention],
+    );
+    const repaintConfirmedMentions = React.useCallback(() => setConfirmedMentionsRevision((revision) => revision + 1), []);
+    useFileMentionCheck({
+        text: message,
+        enabled: inputMode === 'normal' && !isBtwActive,
+        confirmedMentionsRef,
+        resolvePath: resolveFileMentionPath,
+        lister: opencodeClient,
+        onConfirmed: repaintConfirmedMentions,
+    });
+
+    /** An agent the user turned back into text is not asked for by its mention. */
+    const mentionableAgents = React.useCallback(
+        () => agents.filter((agent) => !isMentionDismissed(agent.name.toLowerCase(), confirmedMentionsRef.current)),
+        [agents],
+    );
 
     const extractInlineFileMentions = React.useCallback((
         rawText: string,
@@ -1214,11 +1247,17 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({
     ): Promise<ReadOnSendMentionPreparation> => {
         const prepared = new Map<string, AttachedFile[]>();
         for (const rawText of texts) {
-            for (const token of scanMentions(rawText, confirmedMentionsRef.current)) {
+            const mentions = scanMentions(rawText, confirmedMentionsRef.current).flatMap((token) => {
                 const mention = resolveInlineFileMention(token.name);
+                return mention && isReadOnSendMentionFilename(mention.filename) ? [mention] : [];
+            });
+            // `@logo.png` in pasted text names no file: it stays text and the
+            // message goes. Reading can only fail for a file that is there.
+            const missing = await findMissingPaths(mentions.map((mention) => mention.serverPath), opencodeClient);
+            if (getRuntimeKey() !== runtimeKey) return { status: 'runtime-changed' };
+            for (const mention of mentions) {
                 if (
-                    !mention
-                    || !isReadOnSendMentionFilename(mention.filename)
+                    missing.has(mention.serverPath)
                     || prepared.has(mention.serverPath)
                     || isMentionAlreadyAttached(mention, alreadyAttached)
                 ) {
@@ -1696,7 +1735,7 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({
             toast.error(t('chat.chatInput.toast.attachNamedFailed', { name: readOnSendMentions.filename }));
             return;
         }
-        const { sanitizedText, mention } = parseAgentMentions(messageToQueue, agents);
+        const { sanitizedText, mention } = parseAgentMentions(messageToQueue, mentionableAgents());
         const { attachments: extractedMentionAttachments } = extractInlineFileMentions(sanitizedText, readOnSendMentions.prepared, composerAttachments);
         // #3898: a queued message is delivered later without the composer, so
         // a phantom mention (`@masha.conner`) must be dropped now or the
@@ -1807,7 +1846,7 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({
         if (inputMode !== 'shell') settleModelPick();
         void resumeAfterQueue().catch(console.warn);
         recordLinkedReferences(queueSessionId, queueTarget.directory, linked);
-    }, [getCurrentInputSnapshot, currentSessionId, messageQueueTarget, inputMode, hasDrafts, guestCommands, attachedFiles, sanitizeAttachmentsForSend, prepareReadOnSendMentions, extractInlineFileMentions, agents, availableSkills, consumePendingSyntheticParts, mailboxTarget, inlineDraftTarget, consumeDrafts, linkedReferences, scrollToLatest, clearAttachedFiles, chatDraftIdentity, setLinkedReferencesFor, updateLinkedReferencesFor, isMobile, isMobileCommentOpen, addToQueue, currentProviderId, currentModelId, currentAgentName, currentVariant, t, readSessionMentionsBeforeSend, sessionMentionsIn]);
+    }, [getCurrentInputSnapshot, currentSessionId, messageQueueTarget, inputMode, hasDrafts, guestCommands, attachedFiles, sanitizeAttachmentsForSend, prepareReadOnSendMentions, extractInlineFileMentions, mentionableAgents, availableSkills, consumePendingSyntheticParts, mailboxTarget, inlineDraftTarget, consumeDrafts, linkedReferences, scrollToLatest, clearAttachedFiles, chatDraftIdentity, setLinkedReferencesFor, updateLinkedReferencesFor, isMobile, isMobileCommentOpen, addToQueue, currentProviderId, currentModelId, currentAgentName, currentVariant, t, readSessionMentionsBeforeSend, sessionMentionsIn]);
 
     /** Put the context a queued message was captured with back on the composer chips. */
     const restoreQueuedContext = React.useCallback((context: readonly QueuedContextPart[]) => {
@@ -2390,7 +2429,7 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({
         }, {
             parseAgentMention: (text) => {
                 if (isBtwActive) return { text };
-                const { sanitizedText, mention } = parseAgentMentions(text, agents);
+                const { sanitizedText, mention } = parseAgentMentions(text, mentionableAgents());
                 return { text: sanitizedText, agentName: mention?.name };
             },
             extractFileMentions: (text) => {
@@ -3741,11 +3780,16 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({
         editor.focus();
     });
 
+    const handleAgentSelect = useStableHandler((name: string) => {
+        confirmMention(name.toLowerCase(), confirmedMentionsRef.current);
+        completeMentionSelection(name);
+    });
+
     const handleFileSelect = useStableHandler((file: { name: string; path: string; relativePath?: string }) => {
         const mentionPath = (file.relativePath && file.relativePath.trim().length > 0)
             ? file.relativePath.trim()
             : (toMentionPath(file.path) || file.name);
-        confirmedMentionsRef.current.add(mentionPath);
+        confirmMention(mentionPath, confirmedMentionsRef.current);
         completeMentionSelection(mentionPath);
     });
 
@@ -3940,7 +3984,7 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({
             .filter((entry) => entry.length > 0);
 
         for (const p of paths) {
-            confirmedMentionsRef.current.add(p);
+            confirmMention(p, confirmedMentionsRef.current);
         }
 
         const mentions = Array.from(new Set(paths.map((entry) => `@${entry}`)));
@@ -4016,7 +4060,7 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({
         // Internal drag: file tree → chat input (relative path as @mention)
         const internalPath = e.dataTransfer.getData('application/x-openchamber-file-path');
         if (internalPath && internalPath !== '.') {
-            confirmedMentionsRef.current.add(internalPath);
+            confirmMention(internalPath, confirmedMentionsRef.current);
             const mention = `@${internalPath}`;
             const textarea = composerRef.current;
             const currentMessage = messageRef.current;
@@ -5026,7 +5070,7 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({
                         snippetDraftText={snippetDraftText}
                         onSnippetDraftSaved={handleSnippetDraftSaved}
                         onFileSelect={handleFileSelect}
-                        onAgentSelect={completeMentionSelection}
+                        onAgentSelect={handleAgentSelect}
                         // VS Code shows no reference chips, so it cannot hold one.
                         onSessionSelect={isVSCode ? undefined : handleSessionSelect}
                         onExtensionMentionSelect={isVSCode || isBtwActive ? undefined : handleExtensionMentionSelect}
