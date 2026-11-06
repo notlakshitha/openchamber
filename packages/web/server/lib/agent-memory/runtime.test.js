@@ -96,6 +96,36 @@ describe('read', () => {
     await expect(runtime.read(GLOBAL)).rejects.toThrow('malformed');
   });
 
+  test('invalid document shape fails instead of reading as empty', async () => {
+    // Object-shaped entries (or a missing entries array) is valid JSON but not a
+    // memory document. Treating it as empty invited a later create/update to
+    // overwrite recoverable bytes — refuse the read and leave the file alone.
+    await writeJson(globalPath(), { entries: { recoverable: 'fixture' } });
+
+    await expect(runtime.read(GLOBAL)).rejects.toThrow(/invalid document shape|unreadable/i);
+    expect(JSON.parse(await fsPromises.readFile(globalPath(), 'utf8'))).toEqual({
+      entries: { recoverable: 'fixture' },
+    });
+  });
+
+  test('create refuses to overwrite an invalid document shape', async () => {
+    await writeJson(globalPath(), { entries: { recoverable: 'fixture' } });
+
+    await expect(runtime.create(GLOBAL, { title: 'Fixture', body: 'New entry' }))
+      .rejects.toThrow(/invalid document shape|unreadable/i);
+    expect(JSON.parse(await fsPromises.readFile(globalPath(), 'utf8'))).toEqual({
+      entries: { recoverable: 'fixture' },
+    });
+  });
+
+  test('empty object and non-array entries are invalid document shapes', async () => {
+    await writeJson(globalPath(), {});
+    await expect(runtime.read(GLOBAL)).rejects.toThrow(/invalid document shape|unreadable/i);
+
+    await writeJson(globalPath(), { version: 1, entries: 'nope' });
+    await expect(runtime.read(GLOBAL)).rejects.toThrow(/invalid document shape|unreadable/i);
+  });
+
   test('drops malformed entries without failing the read', async () => {
     await writeJson(globalPath(), {
       version: 1,

@@ -296,10 +296,13 @@ export const createAgentMemoryRuntime = (deps) => {
   };
 
   /**
-   * Missing is authoritative empty; malformed is a failure. An agent that reads
-   * "no memory" from a corrupt file would cheerfully rewrite everything it
-   * thought it had lost.
+   * Missing is authoritative empty; malformed / invalid shape is a failure. An
+   * agent that reads "no memory" from a corrupt or wrong-shaped file would
+   * cheerfully rewrite everything it thought it had lost — including bytes that
+   * were still recoverable.
    */
+  const isMemoryDocument = (value) => isObjectRecord(value) && Array.isArray(value.entries);
+
   const read = async (target) => {
     const resolved = resolveTarget(target);
     const stored = await readJson(resolved.filePath);
@@ -309,6 +312,9 @@ export const createAgentMemoryRuntime = (deps) => {
     }
     if (stored.missing) {
       return createEmptyMemory();
+    }
+    if (!isMemoryDocument(stored.value)) {
+      throw new Error('Stored agent memory has an invalid document shape');
     }
 
     return {
